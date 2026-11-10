@@ -1,0 +1,129 @@
+# Comprehensive Implementation Specification: Pez Non-Custodial Wallet & Multi-Rail Checkout
+
+## 1. Executive Summary & Architecture Goal
+Refactor Pez to eliminate all client-side private key, seed phrase, and mnemonic generation. Replace it with **Reown AppKit** (formerly Web3Modal) for non-custodial wallet creation, connection, and on-chain asset management. 
+
+Preserve and integrate with:
+1. Supabase `user_wallets` table for persisting verified user wallet addresses.
+2. Existing `nowpayments` Supabase edge function for manual crypto transfers.
+3. Existing `reloadly` Supabase edge functions for fulfilling mobile top-up and gift card purchases.
+
+---
+
+## 2. Dependencies & Reown AppKit Configuration
+
+### 2.1 Dependencies
+Install the required packages:
+- `@reown/appkit`
+- `@reown/appkit-adapter-wagmi`
+- `wagmi`
+- `viem`
+- `@tanstack/react-query`
+
+### 2.2 AppKit Provider Setup (`src/lib/reown-config.ts`)
+- Initialize Reown AppKit with EVM networks:
+  - Polygon (POL, USDT, USDC)
+  - BNB Smart Chain (BNB, USDT)
+  - Arbitrum One (ARB, ETH, USDT, USDC)
+  - Base (ETH, USDC)
+  - Optimism (OP, ETH)
+  - Avalanche C-Chain (AVAX, USDT)
+  - Ethereum Mainnet (ETH, USDT, USDC)
+- **Built-in RPC**: Route all blockchain reads, contract calls, and transaction broadcasts through Reown's built-in RPC infrastructure using `projectId` (from `import.meta.env.VITE_REOWN_PROJECT_ID`). No third-party RPC provider keys (Alchemy/Infura) required.
+- **Embedded Wallets**: Enable Reown Social & Email authentication. When new users without an existing crypto wallet sign up or create a wallet, Reown generates a non-custodial, passkey/secure-enclave wallet directly in the modal.
+- Wrap the application tree with `WagmiProvider` and `QueryClientProvider`.
+
+---
+
+## 3. Deprecating Custom Wallet Code
+
+Completely remove the legacy custodial/client-generated wallet logic:
+1. Remove `WalletSetupDialog.tsx` (the custom mnemonic and password generation modal).
+2. Remove `non-custodial-wallet.ts` functions that generate, encrypt, or store private keys or seed phrases in browser `localStorage`, `sessionStorage`, or `IndexedDB`.
+3. Eliminate any client-side transaction signing functions that used stored private keys.
+4. Keep the application 100% non-custodial: Pez must never hold, derive, or store private keys or recovery phrases.
+
+---
+
+## 4. Supabase Database & Wallet Linking
+
+### 4.1 Schema Reference (`user_wallets` Table)
+Maintain the `user_wallets` table structure in Supabase:
+- `id` (UUID, Primary Key)
+- `user_id` (UUID, Foreign Key to `auth.users`, cascades on delete)
+- `wallet_address` (Text, normalized to lowercase)
+- `chain_id` (Integer)
+- `wallet_type` (Text: `'reown_embedded'` | `'external'`)
+- `is_primary` (Boolean, default `true`)
+- `created_at` / `updated_at` (Timestamp)
+- Unique constraint on `(user_id, wallet_address)`.
+
+### 4.2 Account Linking Logic
+When a logged-in user (via Supabase Email, Google, or Passkey) connects their wallet:
+1. Retrieve the active address from Reown via Wagmi's `useAccount()`.
+2. Check if the address is already linked in `user_wallets` for the current `user.id`.
+3. If not linked:
+   - Request the user sign a lightweight verification message via their wallet:
+     `"Verify ownership of wallet [address] for Pez account [user.id] at [timestamp]"`
+   - Upon valid signature, upsert the record into `user_wallets` with `user_id` and `wallet_address`.
+4. **Wallet-First Login (Optional / SIWE)**:
+   - On the login screen, provide "Sign in with Wallet".
+   - The user connects through Reown, signs a SIWE (Sign-In with Ethereum) message, and the backend verifies the signature to issue a Supabase auth session.
+
+---
+
+## 5. Non-Custodial Wallet Screen (`wallet.tsx`)
+
+Retain the layout and UI components (`WalletHeader`, `AssetList`, `RecentActivity`) while replacing the data provider:
+
+### 5.1 Connection State
+- **Disconnected**:
+  - Show a prominent **"Connect or Create Wallet"** button that triggers Reown's `open()` modal.
+  - Reown displays options: connect existing wallet (MetaMask, Trust Wallet, Phantom, Coinbase, etc.) OR create an embedded wallet with Email/Google.
+- **Connected**:
+  - Show the connected `0x...` address with a one-click copy button and QR code preview.
+  - Display the active network pill with Reown's network switcher.
+  - Display a "Disconnect" action.
+
+### 5.2 Real-Time Asset Balances (`AssetList.tsx`)
+- Read real-time balances using Wagmi's `useBalance` and ERC-20 `balanceOf` contracts via Reown's RPC for all supported EVM assets:
+  - Native: ETH, BNB, POL, AVAX, ARB, OP.
+  - Stablecoins: USDT, USDC across Polygon, BSC, Arbitrum, and Ethereum.
+- Populate token price and USD valuation using the existing price feeds in `crypto-prices.ts`.
+
+### 5.3 Receive Modal (`ReceiveCryptoDialog.tsx`)
+- Display the connected 0x address in full text.
+- Render a scannable QR code using `qrcode.react`.
+- Add a copy button with toast notification.
+- Include a note reminding the user that this address receives all supported EVM tokens (Polygon, BSC, Arbitrum, Ethereum, etc.).
+
+### 5.4 Send Modal (`SendCryptoDialog.tsx`)
+- Input fields: Recipient `0x` address, asset selector, and amount.
+- Non-custodial transaction execution:
+  - For native gas coins: Use Wagmi's `useSendTransaction`.
+  - For ERC-20 tokens (USDT, USDC): Use Wagmi's `useWriteContract` targeting the token contract's `transfer(to, amount)` function.
+- Reown automatically prompts the user to review gas fees and approve the transaction.
+- On broadcast, capture the transaction hash, show a link to the relevant block explorer (Polygonscan, BscScan, Arbiscan, etc.), and record the pending activity in `RecentActivity`.
+
+---
+
+## 6. Checkout Flow: Exactly 2 Payment Options (`checkout.tsx`)
+
+When a customer checks out for a Reloadly Gift Card or Mobile Top-up, present **exactly two payment options**:
+
+```text
++-------------------------------------------------------------------+
+|                     Select Payment Method                         |
++-------------------------------------------------------------------+
+|  [Option 1] Pay with Web3 Wallet (Reown)                          |
+|  - If wallet already connected:                                   |
+|      Shows: "Pay [Amount] [Token]" -> 1-click wallet approval     |
+|  - If wallet NOT connected (or guest):                            |
+|      Shows: "Connect Wallet & Pay" -> Opens Reown modal,         |
+|      connects/creates wallet, then initiates payment              |
++-------------------------------------------------------------------+
+|  [Option 2] Manual Transfer / Other Crypto (NOWPayments)          |
+|  - For users transferring manually from Binance, Bybit, etc.      |
+|  - For non-EVM coins: BTC, SOL, TRX (USDT-TRC20), XRP             |
+|  - Generates deposit address, QR code, and countdown timer        |
++-------------------------------------------------------------------+

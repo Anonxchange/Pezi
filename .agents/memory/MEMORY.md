@@ -1,0 +1,1 @@
+- [Reown and Wagmi compatibility](reown-wagmi-compat.md) — Pin AppKit's connector major to the app's Wagmi major; its transitive range can otherwise resolve an incompatible connector.
